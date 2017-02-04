@@ -170,8 +170,8 @@ var P = (function() {
 
   var IO = {};
 
-  IO.PROJECT_URL = 'http://projects.scratch.mit.edu/internalapi/project/';
-  IO.ASSET_URL = 'http://cdn.assets.scratch.mit.edu/internalapi/asset/';
+  IO.PROJECT_URL = 'https://projects.scratch.mit.edu/internalapi/project/';
+  IO.ASSET_URL = 'https://cdn.assets.scratch.mit.edu/internalapi/asset/';
   IO.SOUNDBANK_URL = 'https://cdn.rawgit.com/LLK/scratch-flash/v429/src/soundbank/';
 
   IO.FONTS = {
@@ -189,6 +189,9 @@ var P = (function() {
     'Permanent Marker': 1.43,
     'Mystery Quest': 1.37
   };
+
+  IO.ADPCM_STEPS = [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767];
+  IO.ADPCM_INDEX = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
 
   IO.init = function(request) {
     IO.projectRequest = request;
@@ -292,7 +295,7 @@ var P = (function() {
     var request = new CompositeRequest;
 
     request.defer = true;
-    request.add(P.IO.load('http://crossorigin.me/http://scratch.mit.edu/projects/' + id + '/').onLoad(function(data) {
+    request.add(P.IO.load('https://scratch.mit.edu/projects/' + id + '/').onLoad(function(data) {
       var m = /<title>\s*(.+?)(\s+on\s+Scratch)?\s*<\/title>/.exec(data);
       if (callback) request.onLoad(callback.bind(self));
       if (m) {
@@ -334,7 +337,7 @@ var P = (function() {
     IO.init(request);
 
     try {
-      IO.zip = new JSZip(ab);
+      IO.zip = Object.prototype.toString.call(ab) === '[object ArrayBuffer]' ? new JSZip(ab) : ab;
       var json = IO.parseJSONish(IO.zip.file('project.json').asText());
 
       IO.loadProject(json);
@@ -415,15 +418,96 @@ var P = (function() {
 
   IO.decodeAudio = function(ab, cb) {
     if (audioContext) {
-      audioContext.decodeAudioData(ab, function(buffer) {
-        cb(buffer);
-      }, function(err) {
-        console.warn('Failed to load audio');
-        cb(null);
+      IO.decodeADPCMAudio(ab, function(err, buffer) {
+        if (buffer) return setTimeout(function() {cb(buffer)});
+        var p = audioContext.decodeAudioData(ab, function(buffer) {
+          cb(buffer);
+        }, function(err2) {
+          console.warn(err, err2);
+          cb(null);
+        });
+        if (p.catch) p.catch(function() {});
       });
     } else {
       setTimeout(cb);
     }
+  };
+
+  IO.decodeADPCMAudio = function(ab, cb) {
+    var dv = new DataView(ab);
+    if (dv.getUint32(0) !== 0x52494646 || dv.getUint32(8) !== 0x57415645) {
+      return cb(new Error('Unrecognized audio format'));
+    }
+
+    var blocks = {};
+    var i = 12, l = dv.byteLength - 8;
+    while (i < l) {
+      blocks[String.fromCharCode(
+        dv.getUint8(i),
+        dv.getUint8(i + 1),
+        dv.getUint8(i + 2),
+        dv.getUint8(i + 3))] = i;
+      i += 8 + dv.getUint32(i + 4, true);
+    }
+
+    var format        = dv.getUint16(20, true);
+    var channels      = dv.getUint16(22, true);
+    var sampleRate    = dv.getUint32(24, true);
+    var byteRate      = dv.getUint32(28, true);
+    var blockAlign    = dv.getUint16(32, true);
+    var bitsPerSample = dv.getUint16(34, true);
+
+    if (format === 17) {
+      var samplesPerBlock = dv.getUint16(38, true);
+      var blockSize = ((samplesPerBlock - 1) / 2) + 4;
+
+      var frameCount = dv.getUint32(blocks.fact + 8, true);
+
+      var buffer = audioContext.createBuffer(1, frameCount, sampleRate);
+      var channel = buffer.getChannelData(0);
+
+      var sample, index = 0;
+      var step, code, delta;
+      var lastByte = -1;
+
+      var offset = blocks.data + 8;
+      i = offset;
+      var j = 0;
+      while (true) {
+        if ((((i - offset) % blockSize) == 0) && (lastByte < 0)) {
+          if (i >= dv.byteLength) break;
+          sample = dv.getInt16(i, true); i += 2;
+          index = dv.getUint8(i); i += 1;
+          i++;
+          if (index > 88) index = 88;
+          channel[j++] = sample / 32767;
+        } else {
+          if (lastByte < 0) {
+            if (i >= dv.byteLength) break;
+            lastByte = dv.getUint8(i); i += 1;
+            code = lastByte & 0xf;
+          } else {
+            code = (lastByte >> 4) & 0xf;
+            lastByte = -1;
+          }
+          step = IO.ADPCM_STEPS[index];
+          delta = 0;
+          if (code & 4) delta += step;
+          if (code & 2) delta += step >> 1;
+          if (code & 1) delta += step >> 2;
+          delta += step >> 3;
+          index += IO.ADPCM_INDEX[code];
+          if (index > 88) index = 88;
+          if (index < 0) index = 0;
+          sample += (code & 8) ? -delta : delta;
+          if (sample > 32767) sample = 32767;
+          if (sample < -32768) sample = -32768;
+          channel[j++] = sample / 32768;
+        }
+      }
+      return cb(null, buffer);
+    }
+    cb(new Error('Unrecognized WAV format ' + format));
   };
 
   IO.loadBase = function(data) {
@@ -512,9 +596,13 @@ var P = (function() {
     var ext = md5.split('.').pop();
     if (ext === 'svg') {
       var cb = function(source) {
-        var div = document.createElement('div');
-        div.innerHTML = source;
-        var svg = div.getElementsByTagName('svg')[0];
+        var parser = new DOMParser();
+        var doc = parser.parseFromString(source, 'image/svg+xml');
+        var svg = doc.documentElement;
+        if (!svg.style) {
+          doc = parser.parseFromString('<body>'+source, 'text/html');
+          svg = doc.querySelector('svg');
+        }
         svg.style.visibility = 'hidden';
         svg.style.position = 'absolute';
         svg.style.left = '-10000px';
@@ -530,16 +618,15 @@ var P = (function() {
           viewBox.height = 0;
         }
         IO.fixSVG(svg, svg);
-        while (div.firstChild) div.removeChild(div.lastChild);
-        div.appendChild(svg);
-        svg.style.visibility = 'visible';
+        document.body.removeChild(svg);
+        svg.style.visibility = svg.style.position = svg.style.left = svg.style.top = '';
 
         var canvas = document.createElement('canvas');
         var image = new Image;
         callback(image);
         // svg.style.cssText = '';
         // console.log(md5, 'data:image/svg+xml;base64,' + btoa(div.innerHTML.trim()));
-        canvg(canvas, div.innerHTML.trim(), {
+        canvg(canvas, new XMLSerializer().serializeToString(svg), {
           ignoreMouse: true,
           ignoreAnimation: true,
           ignoreClear: true,
@@ -686,15 +773,10 @@ var P = (function() {
       watcher.target = this;
       watcher.label = (watcher.target === stage ? '' : watcher.target.objName + ': ') + name;
       watcher.param = name;
-      stage.children.push(watcher);
-    } else {
-      var i = stage.children.indexOf(watcher);
-      if (i !== stage.children.length - 1) {
-        stage.children.splice(i, 1);
-        stage.children.push(watcher);
-      }
+      stage.allWatchers.push(watcher);
     }
     watcher.visible = visible;
+    watcher.layout();
   };
 
   Base.prototype.showNextCostume = function() {
@@ -742,24 +824,20 @@ var P = (function() {
   };
 
   Base.prototype.setFilter = function(name, value) {
-    var min = 0;
-    var max = 100;
     switch (name) {
-      case 'whirl':
-      case 'fisheye':
-      case 'pixelate': // absolute value
-      case 'mosaic': // absolute value
-        min = -Infinity;
-        max = Infinity;
+      case 'ghost':
+        if (value < 0) value = 0;
+        if (value > 100) value = 100;
+        break;
+      case 'brightness':
+        if (value < -100) value = -100;
+        if (value > 100) value = 100;
         break;
       case 'color':
         value = value % 200;
         if (value < 0) value += 200;
-        max = 200;
         break;
     }
-    if (value < min) value = min;
-    if (value > max) value = max;
     this.filters[name] = value;
     if (this.isStage) this.updateFilters();
   };
@@ -833,6 +911,8 @@ var P = (function() {
     Stage.parent.call(this);
 
     this.children = [];
+    this.allWatchers = [];
+    this.dragging = Object.create(null);
     this.defaultWatcherX = 10;
     this.defaultWatcherY = 10;
 
@@ -848,8 +928,8 @@ var P = (function() {
     this.baseTime = 0;
     this.timerStart = 0;
 
-    this.keys = []
-    this.keys[128] = 0;
+    this.keys = [];
+    this.keys.any = 0;
     this.rawMouseX = 0;
     this.rawMouseY = 0;
     this.mouseX = 0;
@@ -861,8 +941,9 @@ var P = (function() {
     this.root.style.overflow = 'hidden';
     this.root.style.width = '480px';
     this.root.style.height = '360px';
-    this.root.style.fontSize = '1px';
+    this.root.style.fontSize = '10px';
     this.root.style.background = '#fff';
+    this.root.style.contain = 'strict';
     this.root.style.WebkitUserSelect =
     this.root.style.MozUserSelect =
     this.root.style.MSUserSelect =
@@ -888,37 +969,55 @@ var P = (function() {
     this.canvas.height = SCALE * 360;
     this.context = this.canvas.getContext('2d');
 
+    this.ui = document.createElement('div');
+    this.root.appendChild(this.ui);
+    this.ui.style.pointerEvents = 'none';
+    this.ui.style.contain = 'strict';
+
     this.canvas.tabIndex = 0;
     this.canvas.style.outline = 'none';
     this.backdropCanvas.style.position =
     this.penCanvas.style.position =
-    this.canvas.style.position = 'absolute';
+    this.canvas.style.position =
+    this.ui.style.position = 'absolute';
+    this.backdropCanvas.style.left =
+    this.penCanvas.style.left =
+    this.canvas.style.left =
+    this.ui.style.left =
+    this.backdropCanvas.style.top =
+    this.penCanvas.style.top =
+    this.canvas.style.top =
+    this.ui.style.top = 0;
     this.backdropCanvas.style.width =
     this.penCanvas.style.width =
-    this.canvas.style.width = '480px';
+    this.canvas.style.width =
+    this.ui.style.width = '480px';
     this.backdropCanvas.style.height =
     this.penCanvas.style.height =
-    this.canvas.style.height = '360px';
+    this.canvas.style.height =
+    this.ui.style.height = '360px';
 
-    // hardware acceleration
-    this.root.style.WebkitTransform = 'translateZ(0)';
+    this.backdropCanvas.style.transform =
+    this.penCanvas.style.transform =
+    this.canvas.style.transform =
+    this.ui.style.transform = 'translateZ(0)';
 
     this.root.addEventListener('keydown', function(e) {
-      if (e.ctrlKey || e.altKey || e.metaKey || e.keyCode === 27) {
-        return;
-      }
-      if (!this.keys[e.keyCode]) this.keys[128]++
-      this.keys[e.keyCode] = true;
+      var c = e.keyCode;
+      if (!this.keys[c]) this.keys.any++;
+      this.keys[c] = true;
+      if (e.ctrlKey || e.altKey || e.metaKey || c === 27) return;
       e.stopPropagation();
       if (e.target === this.canvas) {
         e.preventDefault();
-        this.trigger('whenKeyPressed', e.keyCode);
+        this.trigger('whenKeyPressed', c);
       }
     }.bind(this));
 
     this.root.addEventListener('keyup', function(e) {
-      if (this.keys[e.keyCode]) this.keys[128]--
-      this.keys[e.keyCode] = false;
+      var c = e.keyCode;
+      if (this.keys[c]) this.keys.any--;
+      this.keys[c] = false;
       e.stopPropagation();
       if (e.target === this.canvas) {
         e.preventDefault();
@@ -927,28 +1026,39 @@ var P = (function() {
 
     if (hasTouchEvents) {
 
-      document.addEventListener('touchstart', function(e) {
+      document.addEventListener('touchstart', this.onTouchStart = function(e) {
         this.mousePressed = true;
         for (var i = 0; i < e.changedTouches.length; i++) {
-          this.updateMouse(e.changedTouches[i]);
+          var t = e.changedTouches[i];
+          this.updateMouse(t);
           if (e.target === this.canvas) {
             this.clickMouse();
+          } else if (e.target.dataset.button != null || e.target.dataset.slider != null) {
+            this.watcherStart(t.identifier, t, e);
           }
         }
         if (e.target === this.canvas) e.preventDefault();
       }.bind(this));
 
-      document.addEventListener('touchmove', function(e) {
+      document.addEventListener('touchmove', this.onTouchMove = function(e) {
         this.updateMouse(e.changedTouches[0]);
+        for (var i = 0; i < e.changedTouches.length; i++) {
+          var t = e.changedTouches[i];
+          this.watcherMove(t.identifier, t, e);
+        }
       }.bind(this));
 
-      document.addEventListener('touchend', function(e) {
+      document.addEventListener('touchend', this.onTouchEnd = function(e) {
         this.releaseMouse();
+        for (var i = 0; i < e.changedTouches.length; i++) {
+          var t = e.changedTouches[i];
+          this.watcherEnd(t.identifier, t, e);
+        }
       }.bind(this));
 
     } else {
 
-      document.addEventListener('mousedown', function(e) {
+      document.addEventListener('mousedown', this.onMouseDown = function(e) {
         this.updateMouse(e);
         this.mousePressed = true;
 
@@ -956,28 +1066,39 @@ var P = (function() {
           this.clickMouse();
           e.preventDefault();
           this.canvas.focus();
+        } else {
+          if (e.target.dataset.button != null || e.target.dataset.slider != null) {
+            this.watcherStart('mouse', e, e);
+          }
+          if (e.target !== this.prompt) setTimeout(function() {
+            this.canvas.focus();
+          }.bind(this));
         }
       }.bind(this));
 
-      document.addEventListener('mousemove', function(e) {
+      document.addEventListener('mousemove', this.onMouseMove = function(e) {
         this.updateMouse(e);
+        this.watcherMove('mouse', e, e);
       }.bind(this));
 
-      document.addEventListener('mouseup', function(e) {
+      document.addEventListener('mouseup', this.onMouseUp = function(e) {
         this.updateMouse(e);
         this.releaseMouse();
+        this.watcherEnd('mouse', e, e);
       }.bind(this));
     }
 
     this.prompter = document.createElement('div');
-    this.root.appendChild(this.prompter);
+    this.ui.appendChild(this.prompter);
+    this.prompter.style.zIndex = '1';
+    this.prompter.style.pointerEvents = 'auto';
     this.prompter.style.position = 'absolute';
     this.prompter.style.left =
-    this.prompter.style.right = '14em';
-    this.prompter.style.bottom = '6em';
-    this.prompter.style.padding = '5em 30em 5em 5em';
-    this.prompter.style.border = '3em solid rgb(46, 174, 223)';
-    this.prompter.style.borderRadius = '8em';
+    this.prompter.style.right = '1.4em';
+    this.prompter.style.bottom = '.6em';
+    this.prompter.style.padding = '.5em 3.0em .5em .5em';
+    this.prompter.style.border = '.3em solid rgb(46, 174, 223)';
+    this.prompter.style.borderRadius = '.8em';
     this.prompter.style.background = '#fff';
     this.prompter.style.display = 'none';
 
@@ -985,7 +1106,7 @@ var P = (function() {
     this.prompter.appendChild(this.promptTitle);
     this.promptTitle.textContent = '';
     this.promptTitle.style.cursor = 'default';
-    this.promptTitle.style.font = 'bold 13em sans-serif';
+    this.promptTitle.style.font = 'bold 1.3em sans-serif';
     this.promptTitle.style.margin = '0 '+(-25/13)+'em '+(5/13)+'em 0';
     this.promptTitle.style.whiteSpace = 'pre';
     this.promptTitle.style.overflow = 'hidden';
@@ -997,7 +1118,7 @@ var P = (function() {
     this.prompt.style.background = '#eee';
     this.prompt.style.MozBoxSizing =
     this.prompt.style.boxSizing = 'border-box';
-    this.prompt.style.font = '13em sans-serif';
+    this.prompt.style.font = '1.3em sans-serif';
     this.prompt.style.padding = '0 '+(3/13)+'em';
     this.prompt.style.outline = '0';
     this.prompt.style.margin = '0';
@@ -1012,13 +1133,13 @@ var P = (function() {
 
     this.promptButton = document.createElement('div');
     this.prompter.appendChild(this.promptButton);
-    this.promptButton.style.width = '22em';
-    this.promptButton.style.height = '22em';
+    this.promptButton.style.width = '2.2em';
+    this.promptButton.style.height = '2.2em';
     this.promptButton.style.position = 'absolute';
-    this.promptButton.style.right = '4em';
-    this.promptButton.style.bottom = '4em';
-    this.promptButton.style.background = 'url(icons.svg) -165em -37em';
-    this.promptButton.style.backgroundSize = '320em 96em';
+    this.promptButton.style.right = '.4em';
+    this.promptButton.style.bottom = '.4em';
+    this.promptButton.style.background = 'url(icons.svg) -16.5em -3.7em';
+    this.promptButton.style.backgroundSize = '32.0em 9.6em';
 
     this.prompt.addEventListener('keydown', function(e) {
       if (e.keyCode === 13) {
@@ -1034,16 +1155,54 @@ var P = (function() {
 
   Stage.prototype.isStage = true;
 
+  Stage.prototype.watcherStart = function(id, t, e) {
+    var p = e.target;
+    while (p && p.dataset.watcher == null) p = p.parentElement;
+    if (!p) return;
+    var w = this.allWatchers[p.dataset.watcher]
+    this.dragging[id] = {
+      watcher: w,
+      offset: (e.target.dataset.button == null ? -w.button.offsetWidth / 2 | 0 : w.button.getBoundingClientRect().left - t.clientX) - w.slider.getBoundingClientRect().left
+    };
+  };
+  Stage.prototype.watcherMove = function(id, t, e) {
+    var d = this.dragging[id];
+    if (!d) return;
+    var w = d.watcher
+    var sw = w.slider.offsetWidth;
+    var bw = w.button.offsetWidth;
+    var value = w.sliderMin + Math.max(0, Math.min(1, (t.clientX + d.offset) / (sw - bw))) * (w.sliderMax - w.sliderMin);
+    w.target.vars[w.param] = w.isDiscrete ? Math.round(value) : Math.round(value * 100) / 100;
+    w.update();
+    e.preventDefault();
+  };
+  Stage.prototype.watcherEnd = function(id, t, e) {
+    this.watcherMove(id, t, e);
+    delete this.dragging[id];
+  };
+
+  Stage.prototype.destroy = function() {
+    this.stopAll();
+    this.pause();
+    if (this.onTouchStart) document.removeEventListener('touchstart', this.onTouchStart);
+    if (this.onTouchMove) document.removeEventListener('touchmove', this.onTouchMove);
+    if (this.onTouchEnd) document.removeEventListener('touchend', this.onTouchEnd);
+    if (this.onMouseDown) document.removeEventListener('mousedown', this.onMouseDown);
+    if (this.onMouseMove) document.removeEventListener('mousemove', this.onMouseMove);
+    if (this.onMouseUp) document.removeEventListener('mouseup', this.onMouseUp);
+  };
+
   Stage.prototype.fromJSON = function(data) {
     Stage.parent.prototype.fromJSON.call(this, data);
 
     data.children.forEach(function(d) {
       if (d.listName) return;
-      this.children.push(new (d.cmd ? Watcher : Sprite)(this).fromJSON(d));
+      if (d.cmd) this.allWatchers.push(new Watcher(this).fromJSON(d));
+      else this.children.push(new Sprite(this).fromJSON(d));
     }, this);
 
-    this.children.forEach(function(child) {
-      if (child.resolve) child.resolve();
+    this.allWatchers.forEach(function(child) {
+      child.resolve();
     }, this);
 
     P.compile(this);
@@ -1105,12 +1264,14 @@ var P = (function() {
     this.root.style.width =
     this.canvas.style.width =
     this.backdropCanvas.style.width =
-    this.penCanvas.style.width = (480 * zoom | 0) + 'px';
+    this.penCanvas.style.width =
+    this.ui.style.width = (480 * zoom | 0) + 'px';
     this.root.style.height =
     this.canvas.style.height =
     this.backdropCanvas.style.height =
-    this.penCanvas.style.height = (360 * zoom | 0) + 'px';
-    this.root.style.fontSize = zoom + 'px';
+    this.penCanvas.style.height =
+    this.ui.style.height = (360 * zoom | 0) + 'px';
+    this.root.style.fontSize = (zoom*10) + 'px';
     this.zoom = zoom;
     this.updateBackdrop();
   };
@@ -1119,7 +1280,7 @@ var P = (function() {
     this.mouseSprite = undefined;
     for (var i = this.children.length; i--;) {
       var c = this.children[i];
-      if (c.isSprite && c.visible && c.filters.ghost < 100 && c.touching('_mouse_')) {
+      if (c.visible && c.filters.ghost < 100 && c.touching('_mouse_')) {
         if (c.isDraggable) {
           this.mouseSprite = c;
           c.mouseDown();
@@ -1142,9 +1303,7 @@ var P = (function() {
 
   Stage.prototype.stopAllSounds = function() {
     for (var children = this.children, i = children.length; i--;) {
-      if (children[i].isSprite) {
-        children[i].stopSounds();
-      }
+      children[i].stopSounds();
     }
     this.stopSounds();
   };
@@ -1189,6 +1348,10 @@ var P = (function() {
 
     context.scale(this.zoom * SCALE, this.zoom * SCALE);
     this.drawOn(context);
+    for (var i = this.allWatchers.length; i--;) {
+      var w = this.allWatchers[i];
+      if (w.visible) w.update();
+    }
 
     if (this.hidePrompt) {
       this.hidePrompt = false;
@@ -1199,8 +1362,9 @@ var P = (function() {
 
   Stage.prototype.drawOn = function(context, except) {
     for (var i = 0; i < this.children.length; i++) {
-      if (this.children[i].visible && this.children[i] !== except) {
-        this.children[i].draw(context);
+      var c = this.children[i];
+      if (c.visible && c !== except) {
+        c.draw(context);
       }
     }
   };
@@ -1234,12 +1398,12 @@ var P = (function() {
   };
 
   var KEY_CODES = {
-    'space': 32,
+    space: 32,
     'left arrow': 37,
     'up arrow': 38,
     'right arrow': 39,
     'down arrow': 40,
-    'any': 128
+    any: 'any'
   };
 
   var getKeyCode = function(keyName) {
@@ -1331,6 +1495,7 @@ var P = (function() {
     };
 
     c.direction = this.direction;
+    c.instrument = this.instrument;
     c.indexInLibrary = this.indexInLibrary;
     c.isDraggable = this.isDraggable;
     c.rotationStyle = this.rotationStyle;
@@ -1376,7 +1541,7 @@ var P = (function() {
     if (ox === x && oy === y && !this.isPenDown) return;
     this.scratchX = x;
     this.scratchY = y;
-    if (this.isPenDown) {
+    if (this.isPenDown && !this.isDragging) {
       var context = this.stage.penContext;
       if (this.penSize % 2 > .5 && this.penSize % 2 < 1.5) {
         ox -= .5;
@@ -1695,11 +1860,12 @@ var P = (function() {
       this.bubble.style.borderRadius = ''+(10/14)+'em';
       this.bubble.style.background = '#fff';
       this.bubble.style.position = 'absolute';
-      this.bubble.style.font = 'bold 14em sans-serif';
+      this.bubble.style.font = 'bold 1.4em sans-serif';
       this.bubble.style.whiteSpace = 'pre-wrap';
       this.bubble.style.wordWrap = 'break-word';
       this.bubble.style.textAlign = 'center';
       this.bubble.style.cursor = 'default';
+      this.bubble.style.pointerEvents = 'auto';
       this.bubble.appendChild(this.bubbleText = document.createTextNode(''));
       this.bubble.appendChild(this.bubblePointer = document.createElement('div'));
       this.bubblePointer.style.position = 'absolute';
@@ -1707,7 +1873,7 @@ var P = (function() {
       this.bubblePointer.style.width = ''+(44/14)+'em';
       this.bubblePointer.style.background = 'url(icons.svg) '+(-195/14)+'em '+(-4/14)+'em';
       this.bubblePointer.style.backgroundSize = ''+(320/14)+'em '+(96/14)+'em';
-      this.stage.root.appendChild(this.bubble);
+      this.stage.ui.appendChild(this.bubble);
     }
     this.bubblePointer.style.backgroundPositionX = ((thinking ? -259 : -195)/14)+'em';
     this.bubble.style.display = 'block';
@@ -1751,7 +1917,7 @@ var P = (function() {
 
   Sprite.prototype.remove = function() {
     if (this.bubble) {
-      this.stage.root.removeChild(this.bubble);
+      this.stage.ui.removeChild(this.bubble);
       this.bubble = null;
     }
     if (this.node) {
@@ -1825,6 +1991,12 @@ var P = (function() {
     this.visible = true;
     this.x = 0;
     this.y = 0;
+
+    this.el = null;
+    this.labelEl = null;
+    this.readout = null;
+    this.slider = null;
+    this.button = null;
   };
 
   Watcher.prototype.fromJSON = function(data) {
@@ -1856,6 +2028,7 @@ var P = (function() {
       this.label = this.getLabel();
       if (this.target.isSprite) this.label = this.target.objName + ': ' + this.label;
     }
+    this.layout();
   };
 
   var WATCHER_LABELS = {
@@ -1887,7 +2060,7 @@ var P = (function() {
     return WATCHER_LABELS[this.cmd] || '';
   };
 
-  Watcher.prototype.draw = function(context) {
+  Watcher.prototype.update = function(context) {
     var value = 0;
     if (!this.target) return;
     switch (this.cmd) {
@@ -1902,15 +2075,6 @@ var P = (function() {
         break;
       case 'getVar:':
         value = this.target.vars[this.param];
-        if (this.mode === 3 && this.stage.mousePressed) {
-          var x = this.stage.mouseX + 240 - this.x - 5;
-          var y = 180 - this.stage.mouseY - this.y - 20;
-          if (x >= 0 && y >= 0 && x <= this.width - 5 - 5 && y <= 9) {
-            value = this.sliderMin + Math.max(0, Math.min(1, (x - 2.5) / (this.width - 5 - 5 - 5))) * (this.sliderMax - this.sliderMin);
-            value = this.isDiscrete ? Math.round(value) : Math.round(value * 100) / 100;
-            this.target.vars[this.param] = value;
-          }
-        }
         break;
       case 'heading':
         value = this.target.direction;
@@ -1934,7 +2098,7 @@ var P = (function() {
         value = this.timeAndDate(this.param);
         break;
       case 'timer':
-        value = Math.round((this.stage.now() - this.stage.timerStart) / 100) / 10;
+        value = Math.round((this.stage.rightNow() - this.stage.timerStart) / 100) / 10;
         break;
       case 'volume':
         value = this.target.volume * 100;
@@ -1949,121 +2113,94 @@ var P = (function() {
     if (typeof value === 'number' && (value < 0.001 || value > 0.001)) {
       value = Math.round(value * 1000) / 1000;
     }
-    value = '' + value;
+    this.readout.textContent = '' + value;
+    if (this.slider) {
+      this.buttonWrap.style.transform = 'translate('+((+value || 0) - this.sliderMin) / (this.sliderMax - this.sliderMin)*100+'%,0)';
+    }
+  };
 
-    if (this.labelWidth == null) {
-      context.font = 'bold 11px sans-serif';
-      this.labelWidth = context.measureText(this.label).width;
+  Watcher.prototype.layout = function() {
+    if (this.el) {
+      this.el.style.display = this.visible ? 'block' : 'none';
+      return;
+    }
+    if (!this.visible) return;
+
+    this.el = document.createElement('div');
+    this.el.dataset.watcher = this.stage.allWatchers.indexOf(this);
+    this.el.style.whiteSpace = 'pre';
+    this.el.style.position = 'absolute';
+    this.el.style.left = this.el.style.top = '0';
+    this.el.style.transform = 'translate('+(this.x|0)/10+'em,'+(this.y|0)/10+'em)';
+    this.el.style.cursor = 'default';
+    this.el.style.pointerEvents = 'auto';
+
+    if (this.mode === 2) {
+      this.el.appendChild(this.readout = document.createElement('div'));
+      this.readout.style.minWidth = (38/15)+'em';
+      this.readout.style.font = 'bold 1.5em/'+(19/15)+' sans-serif';
+      this.readout.style.height = (19/15)+'em';
+      this.readout.style.borderRadius = (4/15)+'em';
+      this.readout.style.margin = (3/15)+'em 0 0 0';
+      this.readout.style.padding = '0 '+(3/10)+'em';
+    } else {
+      this.el.appendChild(this.labelEl = document.createElement('div'), this.el.firstChild);
+      this.el.appendChild(this.readout = document.createElement('div'));
+
+      this.el.style.border = '.1em solid rgb(148,145,145)';
+      this.el.style.borderRadius = '.4em';
+      this.el.style.background = 'rgb(193,196,199)';
+      this.el.style.padding = '.2em .6em .3em .5em';
+
+      this.labelEl.textContent = this.label;
+      // this.labelEl.style.marginTop = (1/11)+'em';
+      this.labelEl.style.font = 'bold 1.1em/1 sans-serif';
+      this.labelEl.style.display = 'inline-block';
+
+      this.labelEl.style.verticalAlign =
+      this.readout.style.verticalAlign = 'middle';
+
+      this.readout.style.minWidth = (37/10)+'em';
+      this.readout.style.padding = '0 '+(1/10)+'em';
+      this.readout.style.font = 'bold 1.0em/'+(13/10)+' sans-serif';
+      this.readout.style.height = (13/10)+'em';
+      this.readout.style.borderRadius = (4/10)+'em';
+      this.readout.style.marginLeft = (6/10)+'em';
+    }
+    this.readout.style.color = '#fff';
+    var f = 1 / (this.mode === 2 ? 15 : 10);
+    this.readout.style.border = f+'em solid #fff';
+    this.readout.style.boxShadow = 'inset '+f+'em '+f+'em '+f+'em rgba(0,0,0,.5), inset -'+f+'em -'+f+'em '+f+'em rgba(255,255,255,.5)';
+    this.readout.style.textAlign = 'center';
+    this.readout.style.background = this.color;
+    this.readout.style.display = 'inline-block';
+
+    if (this.mode === 3) {
+      this.el.appendChild(this.slider = document.createElement('div'));
+      this.slider.appendChild(this.buttonWrap = document.createElement('div'));
+      this.buttonWrap.appendChild(this.button = document.createElement('div'));
+
+      this.slider.style.height =
+      this.slider.style.borderRadius = '.5em';
+      this.slider.style.background = 'rgb(192,192,192)';
+      this.slider.style.margin = '.4em 0 .1em';
+      this.slider.style.boxShadow = 'inset .125em .125em .125em rgba(0,0,0,.5), inset -.125em -.125em .125em rgba(255,255,255,.5)';
+      this.slider.style.position = 'relative';
+      this.slider.dataset.slider = '';
+
+      this.slider.style.paddingRight =
+      this.button.style.width =
+      this.button.style.height =
+      this.button.style.borderRadius = '1.1em';
+      this.button.style.position = 'absolute';
+      this.button.style.left = '0';
+      this.button.style.top = '-.3em';
+      this.button.style.background = '#fff';
+      this.button.style.boxShadow = 'inset .3em .3em .2em -.2em rgba(255,255,255,.9), inset -.3em -.3em .2em -.2em rgba(0,0,0,.9), inset 0 0 0 .1em #777';
+      this.button.dataset.button = '';
     }
 
-    context.save();
-    context.translate(this.x, this.y);
-
-    if (this.mode === 1 || this.mode === 3) {
-      context.font = 'bold 11px sans-serif';
-
-      var dw = Math.max(41, 5 + context.measureText(value).width + 5);
-      var r = 5;
-      var w = this.width = 5 + this.labelWidth + 5 + dw + 5;
-      var h = this.mode === 1 ? 21 : 32;
-
-      context.strokeStyle = 'rgb(148, 145, 145)';
-      context.fillStyle = 'rgb(193, 196, 199)';
-      context.lineWidth = 2;
-      context.beginPath();
-      context.arc(r + 1, r + 1, r, Math.PI, Math.PI * 3/2, false);
-      context.arc(w - r - 1, r + 1, r, Math.PI * 3/2, 0, false);
-      context.arc(w - r - 1, h - r - 1, r, 0, Math.PI/2, false);
-      context.arc(r + 1, h - r - 1, r, Math.PI/2, Math.PI, false);
-      context.closePath();
-      context.stroke();
-      context.fill();
-
-      context.fillStyle = '#000';
-      context.fillText(this.label, 5, 14);
-
-      var dh = 15;
-      var dx = 5 + this.labelWidth + 5;
-      var dy = 3;
-      var dr = 4;
-
-      context.save();
-      context.translate(dx, dy);
-
-      context.strokeStyle = '#fff';
-      context.fillStyle = this.color;
-      context.lineWidth = 2;
-      context.beginPath();
-      context.arc(dr + 1, dr + 1, dr, Math.PI, Math.PI * 3/2, false);
-      context.arc(dw - dr - 1, dr + 1, dr, Math.PI * 3/2, 0, false);
-      context.arc(dw - dr - 1, dh - dr - 1, dr, 0, Math.PI/2, false);
-      context.arc(dr + 1, dh - dr - 1, dr, Math.PI/2, Math.PI, false);
-      context.closePath();
-      context.stroke();
-      context.fill();
-
-      context.fillStyle = '#fff';
-      context.textAlign = 'center';
-      context.fillText(value, dw / 2, dh - 4);
-
-      context.restore();
-
-      if (this.mode === 3) {
-        var sh = 5;
-        var sw = w - 5 - 5;
-        var sr = 1.5;
-        var br = 4.5;
-
-        context.save();
-        context.translate(5, 22);
-
-        context.strokeStyle = 'rgb(148, 145, 145)';
-        context.fillStyle = 'rgb(213, 216, 219)';
-        context.lineWidth = 2;
-        context.beginPath();
-        context.arc(sr + 1, sr + 1, sr, Math.PI, Math.PI * 3/2, false);
-        context.arc(sw - sr - 1, sr + 1, sr, Math.PI * 3/2, 0, false);
-        context.arc(sw - sr - 1, sh - sr - 1, sr, 0, Math.PI/2, false);
-        context.arc(sr + 1, sh - sr - 1, sr, Math.PI/2, Math.PI, false);
-        context.closePath();
-        context.stroke();
-        context.fill();
-
-        var x = (sw - sh) * Math.max(0, Math.min(1, ((+value || 0) - this.sliderMin) / (this.sliderMax - this.sliderMin)));
-        context.strokeStyle = 'rgb(108, 105, 105)';
-        context.fillStyle = 'rgb(233, 236, 239)';
-        context.beginPath();
-        context.arc(x + sh / 2, sh / 2, br - 1, 0, Math.PI * 2, false);
-        context.stroke();
-        context.fill();
-
-        context.restore();
-      }
-    } else if (this.mode === 2) {
-      context.font = 'bold 15px sans-serif';
-
-      dh = 21;
-      dw = Math.max(41, 5 + context.measureText(value).width + 5);
-      dr = 4;
-
-      context.strokeStyle = '#fff';
-      context.fillStyle = this.color;
-      context.lineWidth = 2;
-      context.beginPath();
-      context.arc(dr + 1, dr + 1, dr, Math.PI, Math.PI * 3/2, false);
-      context.arc(dw - dr - 1, dr + 1, dr, Math.PI * 3/2, 0, false);
-      context.arc(dw - dr - 1, dh - dr - 1, dr, 0, Math.PI/2, false);
-      context.arc(dr + 1, dh - dr - 1, dr, Math.PI/2, Math.PI, false);
-      context.closePath();
-      context.stroke();
-      context.fill();
-
-      context.fillStyle = '#fff';
-      context.textAlign = 'center';
-      context.fillText(value, dw / 2, dh - 5);
-    }
-
-    context.restore();
+    this.stage.ui.appendChild(this.el);
   };
 
   var AudioContext = window.AudioContext || window.webkitAudioContext;
@@ -2122,6 +2259,7 @@ P.compile = (function() {
     var label = function() {
       var id = nextLabel();
       fns.push(source.length);
+      visual = 0;
       return id;
     };
 
@@ -2184,42 +2322,23 @@ P.compile = (function() {
         t === '%b' ? 'bool' : '';
 
       if (kind === 'num' && usenum) {
+        used[i] = true;
         return 'C.numargs[' + i + ']';
       }
       if (kind === 'bool' && usebool) {
+        used[i] = true;
         return 'C.boolargs[' + i + ']';
       }
 
-      if (usenum) return '(+C.args[' + i + '] || 0)';
-      if (usebool) return 'bool(C.args[' + i + '])';
-      return 'C.args[' + i + ']';
+      var v = 'C.args[' + i + ']';
+      if (usenum) return '(+' + v + ' || 0)';
+      if (usebool) return 'bool(' + v + ')';
+      return v;
     };
 
-    var val = function(e, usenum, usebool) {
+    var val2 = function(e) {
       var v;
-      if (typeof e === 'number' || typeof e === 'boolean') {
-
-        return '' + e;
-
-      } else if (typeof e === 'string') {
-
-        return '"' + e
-          .replace(/\\/g, '\\\\')
-          .replace(/\n/g, '\\n')
-          .replace(/\r/g, '\\r')
-          .replace(/"/g, '\\"')
-          .replace(/\{/g, '\\x7b')
-          .replace(/\}/g, '\\x7d') + '"';
-
-      } else if (e[0] === 'getParam') { /* Data */
-
-        return param(e[1], usenum, usebool);
-
-      } else if ((v = numval(e)) != null || (v = boolval(e)) != null) {
-
-        return v;
-
-      } else if (e[0] === 'costumeName') {
+      if (e[0] === 'costumeName') {
 
         return 'S.getCostumeName()';
 
@@ -2266,6 +2385,41 @@ P.compile = (function() {
       } else {
 
         warn('Undefined val: ' + e[0]);
+
+      }
+    };
+
+    var val = function(e, usenum, usebool) {
+      var v;
+
+      if (typeof e === 'number' || typeof e === 'boolean') {
+
+        return '' + e;
+
+      } else if (typeof e === 'string') {
+
+        return '"' + e
+          .replace(/\\/g, '\\\\')
+          .replace(/\n/g, '\\n')
+          .replace(/\r/g, '\\r')
+          .replace(/"/g, '\\"')
+          .replace(/\{/g, '\\x7b')
+          .replace(/\}/g, '\\x7d') + '"';
+
+      } else if (e[0] === 'getParam') {
+
+        return param(e[1], usenum, usebool);
+
+      } else if ((v = numval(e)) != null || (v = boolval(e)) != null) {
+
+        return v;
+
+      } else {
+
+        v = val2(e);
+        if (usenum) return '(+' + v + ' || 0)';
+        if (usebool) return 'bool(' + v + ')';
+        return v;
 
       }
     };
@@ -2350,6 +2504,39 @@ P.compile = (function() {
 
       } else if (e[0] === 'computeFunction:of:') {
 
+        if (typeof e[1] !== 'object') {
+          switch ('' + e[1]) {
+            case 'abs':
+              return 'Math.abs(' + num(e[2]) + ')';
+            case 'floor':
+              return 'Math.floor(' + num(e[2]) + ')';
+            case 'sqrt':
+              return 'Math.sqrt(' + num(e[2]) + ')';
+            case 'ceiling':
+              return 'Math.ceil(' + num(e[2]) + ')';
+            case 'cos':
+              return 'Math.cos(' + num(e[2]) + ' * Math.PI / 180)';
+            case 'sin':
+              return 'Math.sin(' + num(e[2]) + ' * Math.PI / 180)';
+            case 'tan':
+              return 'Math.tan(' + num(e[2]) + ' * Math.PI / 180)';
+            case 'asin':
+              return 'Math.asin(' + num(e[2]) + ') * 180 / Math.PI';
+            case 'acos':
+              return 'Math.acos(' + num(e[2]) + ') * 180 / Math.PI';
+            case 'atan':
+              return 'Math.atan(' + num(e[2]) + ') * 180 / Math.PI';
+            case 'ln':
+              return 'Math.log(' + num(e[2]) + ')';
+            case 'log':
+              return 'Math.log(' + num(e[2]) + ') / Math.LN10';
+            case 'e ^':
+              return 'Math.exp(' + num(e[2]) + ')';
+            case '10 ^':
+              return 'Math.exp(' + num(e[2]) + ' * Math.LN10)';
+          }
+          return '0';
+        }
         return 'mathFunc(' + val(e[1]) + ', ' + num(e[2]) + ')';
 
       } else if (e[0] === 'mouseX') { /* Sensing */
@@ -2362,7 +2549,7 @@ P.compile = (function() {
 
       } else if (e[0] === 'timer') {
 
-        return '((self.now() - self.timerStart) / 1000)';
+        return '((self.now - self.timerStart) / 1000)';
 
       } else if (e[0] === 'distanceTo:') {
 
@@ -2450,7 +2637,9 @@ P.compile = (function() {
 
       } else if (e[0] === 'keyPressed:') {
 
-        return '!!self.keys[P.getKeyCode(' + val(e[1]) + ')]';
+        var v = typeof e[1] === 'object' ?
+          'P.getKeyCode(' + val(e[1]) + ')' : val(P.getKeyCode(e[1]));
+        return '!!self.keys[' + v + ']';
 
       // } else if (e[0] === 'isLoud') {
 
@@ -2467,7 +2656,7 @@ P.compile = (function() {
         return +e !== 0 && e !== '' && e !== 'false' && e !== false;
       }
       var v = boolval(e);
-      return v != null ? v : 'bool(' + val(e, false, true) + ')';
+      return v != null ? v : val(e, false, true);
     };
 
     var num = function(e) {
@@ -2478,20 +2667,20 @@ P.compile = (function() {
         return +e || 0;
       }
       var v = numval(e);
-      return v != null ? v : '(+' + val(e, true) + ' || 0)';
+      return v != null ? v : val(e, true);
     };
 
     var beatHead = function(dur) {
       source += 'save();\n';
-      source += 'R.start = self.now();\n';
+      source += 'R.start = self.now;\n';
       source += 'R.duration = ' + num(dur) + ' * 60 / self.tempoBPM;\n';
-      source += 'R.first = true;\n';
+      source += 'var first = true;\n';
     };
 
     var beatTail = function(dur) {
         var id = label();
-        source += 'if (self.now() - R.start < R.duration * 1000 || R.first) {\n';
-        source += '  R.first = false;\n';
+        source += 'if (self.now - R.start < R.duration * 1000 || first) {\n';
+        source += '  var first;\n';
         forceQueue(id);
         source += '}\n';
 
@@ -2500,13 +2689,13 @@ P.compile = (function() {
 
     var wait = function(dur) {
       source += 'save();\n';
-      source += 'R.start = self.now();\n';
+      source += 'R.start = self.now;\n';
       source += 'R.duration = ' + dur + ';\n';
-      source += 'R.first = true;\n';
+      source += 'var first = true;\n';
 
       var id = label();
-      source += 'if (self.now() - R.start < R.duration * 1000 || R.first) {\n';
-      source += '  R.first = false;\n';
+      source += 'if (self.now - R.start < R.duration * 1000 || first) {\n';
+      source += '  var first;\n';
       forceQueue(id);
       source += '}\n';
 
@@ -2522,17 +2711,27 @@ P.compile = (function() {
     noRGB += '  S.penCSS = null;';
     noRGB += '}\n';
 
+    var visual = 0;
     var compile = function(block) {
       if (LOG_PRIMITIVES) {
         source += 'console.log(' + val(block[0]) + ');\n';
       }
 
       if (['turnRight:', 'turnLeft:', 'heading:', 'pointTowards:', 'setRotationStyle', 'lookLike:', 'nextCostume', 'say:duration:elapsed:from:', 'say:', 'think:duration:elapsed:from:', 'think:', 'changeGraphicEffect:by:', 'setGraphicEffect:to:', 'filterReset', 'changeSizeBy:', 'setSizeTo:', 'comeToFront', 'goBackByLayers:'].indexOf(block[0]) !== -1) {
-        source += 'if (S.visible) VISUAL = true;\n';
+        if (visual < 2) {
+          source += 'if (S.visible) VISUAL = true;\n';
+          visual = 2;
+        } else if (DEBUG) source += '/* visual: 2 */\n';
       } else if (['forward:', 'gotoX:y:', 'gotoSpriteOrMouse:', 'changeXposBy:', 'xpos:', 'changeYposBy:', 'ypos:', 'bounceOffEdge', 'glideSecs:toX:y:elapsed:from:'].indexOf(block[0]) !== -1) {
-        source += 'if (S.visible || S.isPenDown) VISUAL = true;\n';
+        if (visual < 1) {
+          source += 'if (S.visible || S.isPenDown) VISUAL = true;\n';
+          visual = 1;
+        } else if (DEBUG) source += '/* visual: 1 */\n';
       } else if (['showBackground:', 'startScene', 'nextBackground', 'nextScene', 'startSceneAndWait', 'show', 'hide', 'putPenDown', 'stampCostume', 'showVariable:', 'hideVariable:', 'doAsk', 'setVolumeTo:', 'changeVolumeBy:', 'setTempoTo:', 'changeTempoBy:'].indexOf(block[0]) !== -1) {
-        source += 'VISUAL = true;\n';
+        if (visual < 3) {
+          source += 'VISUAL = true;\n';
+          visual = 3;
+        } else if (DEBUG) source += '/* visual: 3 */\n';
       }
 
       if (block[0] === 'forward:') { /* Motion */
@@ -2601,21 +2800,21 @@ P.compile = (function() {
 
         source += 'self.setCostume(' + val(block[1]) + ');\n';
         source += 'var threads = sceneChange();\n';
-        source += 'if (threads.indexOf(BASE) !== -1) return;\n';
+        source += 'if (threads.indexOf(BASE) !== -1) {return;}\n';
 
       } else if (block[0] === 'nextBackground' ||
                  block[0] === 'nextScene') {
 
         source += 'S.showNextCostume();\n';
         source += 'var threads = sceneChange();\n';
-        source += 'if (threads.indexOf(BASE) !== -1) return;\n';
+        source += 'if (threads.indexOf(BASE) !== -1) {return;}\n';
 
       } else if (block[0] === 'startSceneAndWait') {
 
         source += 'save();\n';
         source += 'self.setCostume(' + val(block[1]) + ');\n';
         source += 'R.threads = sceneChange();\n';
-        source += 'if (R.threads.indexOf(BASE) !== -1) return;\n';
+        source += 'if (R.threads.indexOf(BASE) !== -1) {return;}\n';
         var id = label();
         source += 'if (!running(R.threads)) {\n';
         forceQueue(id);
@@ -2626,11 +2825,11 @@ P.compile = (function() {
 
         source += 'save();\n';
         source += 'R.id = S.say(' + val(block[1]) + ', false);\n';
-        source += 'R.start = self.now();\n';
+        source += 'R.start = self.now;\n';
         source += 'R.duration = ' + num(block[2]) + ';\n';
 
         var id = label();
-        source += 'if (self.now() - R.start < R.duration * 1000) {\n';
+        source += 'if (self.now - R.start < R.duration * 1000) {\n';
         forceQueue(id);
         source += '}\n';
 
@@ -2647,11 +2846,11 @@ P.compile = (function() {
 
         source += 'save();\n';
         source += 'R.id = S.say(' + val(block[1]) + ', true);\n';
-        source += 'R.start = self.now();\n';
+        source += 'R.start = self.now;\n';
         source += 'R.duration = ' + num(block[2]) + ';\n';
 
         var id = label();
-        source += 'if (self.now() - R.start < R.duration * 1000) {\n';
+        source += 'if (self.now - R.start < R.duration * 1000) {\n';
         forceQueue(id);
         source += '}\n';
 
@@ -2678,11 +2877,13 @@ P.compile = (function() {
 
       } else if (block[0] === 'changeSizeBy:') {
 
-        source += 'S.scale += ' + num(block[1]) + ' / 100;\n';
+        source += 'var f = S.scale + ' + num(block[1]) + ' / 100;\n';
+        source += 'S.scale = f < 0 ? 0 : f;\n';
 
       } else if (block[0] === 'setSizeTo:') {
 
-        source += 'S.scale = ' + num(block[1]) + ' / 100;\n';
+        source += 'var f = ' + num(block[1]) + ' / 100;\n';
+        source += 'S.scale = f < 0 ? 0 : f;\n';
 
       } else if (block[0] === 'show') {
 
@@ -2887,14 +3088,14 @@ P.compile = (function() {
       } else if (block[0] === 'broadcast:') { /* Control */
 
         source += 'var threads = broadcast(' + val(block[1]) + ');\n';
-        source += 'if (threads.indexOf(BASE) !== -1) return;\n';
+        source += 'if (threads.indexOf(BASE) !== -1) {return;}\n';
 
       } else if (block[0] === 'call') {
 
         if (DEBUG && block[1] === 'phosphorus: debug') {
           source += 'debugger;\n';
         } else {
-          source += 'call(' + val(block[1]) + ', ' + nextLabel() + ', [';
+          source += 'call(S.procedures[' + val(block[1]) + '], ' + nextLabel() + ', [';
           for (var i = 2; i < block.length; i++) {
             if (i > 2) {
               source += ', ';
@@ -2909,7 +3110,7 @@ P.compile = (function() {
 
         source += 'save();\n';
         source += 'R.threads = broadcast(' + val(block[1]) + ');\n';
-        source += 'if (R.threads.indexOf(BASE) !== -1) return;\n';
+        source += 'if (R.threads.indexOf(BASE) !== -1) {return;}\n';
         var id = label();
         source += 'if (running(R.threads)) {\n';
         forceQueue(id);
@@ -2994,7 +3195,7 @@ P.compile = (function() {
       } else if (block[0] === 'glideSecs:toX:y:elapsed:from:') {
 
         source += 'save();\n';
-        source += 'R.start = self.now();\n';
+        source += 'R.start = self.now;\n';
         source += 'R.duration = ' + num(block[1]) + ';\n';
         source += 'R.baseX = S.scratchX;\n';
         source += 'R.baseY = S.scratchY;\n';
@@ -3002,7 +3203,7 @@ P.compile = (function() {
         source += 'R.deltaY = ' + num(block[3]) + ' - S.scratchY;\n';
 
         var id = label();
-        source += 'var f = (self.now() - R.start) / (R.duration * 1000);\n';
+        source += 'var f = (self.now - R.start) / (R.duration * 1000);\n';
         source += 'if (f > 1) f = 1;\n';
         source += 'S.moveTo(R.baseX + f * R.deltaX, R.baseY + f * R.deltaY);\n';
 
@@ -3081,7 +3282,7 @@ P.compile = (function() {
 
       } else if (block[0] === 'timerReset') {
 
-        source += 'self.timerStart = self.now();\n';
+        source += 'self.timerStart = self.now;\n';
 
       } else {
 
@@ -3097,14 +3298,7 @@ P.compile = (function() {
     if (script[0][0] === 'procDef') {
       var inputs = script[0][2];
       var types = script[0][1].match(/%[snmdcb]/g) || [];
-      for (var i = types.length; i--;) {
-        var t = types[i];
-        if (t === '%d' || t === '%n' || t === '%c') {
-          source += 'C.numargs[' + i + '] = +C.args[' + i + '] || 0;\n';
-        } else if (t === '%b') {
-          source += 'C.boolargs[' + i + '] = bool(C.args[' + i + ']);\n';
-        }
-      }
+      var used = [];
     }
 
     for (var i = 1; i < script.length; i++) {
@@ -3112,6 +3306,19 @@ P.compile = (function() {
     }
 
     if (script[0][0] === 'procDef') {
+      var pre = '';
+      for (var i = types.length; i--;) if (used[i]) {
+        var t = types[i];
+        if (t === '%d' || t === '%n' || t === '%c') {
+          pre += 'C.numargs[' + i + '] = +C.args[' + i + '] || 0;\n';
+        } else if (t === '%b') {
+          pre += 'C.boolargs[' + i + '] = bool(C.args[' + i + ']);\n';
+        }
+      }
+      source = pre + source;
+      for (var i = 1, l = fns.length; i < l; ++i) {
+        fns[i] += pre.length;
+      }
       source += 'endCall();\n';
       source += 'return;\n';
     }
@@ -3126,9 +3333,11 @@ P.compile = (function() {
       while (here < length) {
         var i = source.indexOf('{', here);
         var j = source.indexOf('}', here);
+        var k = source.indexOf('return;', here);
+        if (k === -1) k = length;
         if (i === -1 && j === -1) {
           if (!shouldDelete) {
-            result += source.slice(here);
+            result += source.slice(here, k);
           }
           break;
         }
@@ -3146,6 +3355,10 @@ P.compile = (function() {
             here = j + 1;
           }
         } else {
+          if (brackets === 0 && k < i && k < j) {
+            result += source.slice(here, k);
+            break;
+          }
           if (i < j) {
             result += source.slice(here, i + 1);
             brackets++;
@@ -3218,9 +3431,7 @@ P.compile = (function() {
     compileScripts(stage);
 
     for (var i = 0; i < stage.children.length; i++) {
-      if (!stage.children[i].cmd) {
-        compileScripts(stage.children[i]);
-      }
+      compileScripts(stage.children[i]);
     }
 
     for (var key in warnings) {
@@ -3612,10 +3823,9 @@ P.runtime = (function() {
   };
 
   // var lastCalls = [];
-  var call = function(spec, id, values) {
+  var call = function(procedure, id, values) {
     // lastCalls.push(spec);
     // if (lastCalls.length > 10000) lastCalls.shift();
-    var procedure = S.procedures[spec];
     if (procedure) {
       STACK.push(R);
       CALLS.push(C);
@@ -3751,15 +3961,13 @@ P.runtime = (function() {
     P.Stage.prototype.trigger = function(event, arg) {
       var threads = [];
       for (var i = this.children.length; i--;) {
-        if (this.children[i].isSprite) {
-          threads = threads.concat(this.triggerFor(this.children[i], event, arg));
-        }
+        threads = threads.concat(this.triggerFor(this.children[i], event, arg));
       }
       return threads.concat(this.triggerFor(this, event, arg));
     };
 
     P.Stage.prototype.triggerGreenFlag = function() {
-      this.timerStart = this.now();
+      this.timerStart = this.rightNow();
       this.trigger('whenGreenFlag');
     };
 
@@ -3769,14 +3977,16 @@ P.runtime = (function() {
       addEventListener('error', this.onError);
       this.baseTime = Date.now();
       this.interval = setInterval(this.step.bind(this), 1000 / this.framerate);
+      if (audioContext) audioContext.resume();
     };
 
     P.Stage.prototype.pause = function() {
       if (this.interval) {
-        this.baseNow = this.now();
+        this.baseNow = this.rightNow();
         clearInterval(this.interval);
         delete this.interval;
         removeEventListener('error', this.onError);
+        if (audioContext) audioContext.suspend();
       }
       this.isRunning = false;
     };
@@ -3794,7 +4004,7 @@ P.runtime = (function() {
           c.remove();
           this.children.splice(i, 1);
           i -= 1;
-        } else if (c.isSprite) {
+        } else {
           c.resetFilters();
           if (c.saying) c.say('');
           c.stopSounds();
@@ -3802,7 +4012,7 @@ P.runtime = (function() {
       }
     };
 
-    P.Stage.prototype.now = function() {
+    P.Stage.prototype.rightNow = function() {
       return this.baseNow + Date.now() - this.baseTime;
     };
 
@@ -3812,6 +4022,7 @@ P.runtime = (function() {
       var start = Date.now();
       do {
         var queue = this.queue;
+        this.now = this.rightNow();
         for (THREAD = 0; THREAD < queue.length; THREAD++) {
           if (queue[THREAD]) {
             S = queue[THREAD].sprite;
